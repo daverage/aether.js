@@ -4,7 +4,7 @@
 
 **Aether.js is a production-ready, zero-dependency JavaScript library for the modern web. It provides just enough structure and utility to handle common client-side tasks without the overhead of a large framework, now with enhanced performance, reliability, and developer experience.**
 
-Think of it as the minimalist's toolkit for building fast, efficient, and maintainable websites and single-page applicationsâ€”refined for real-world use.
+Think of it as the minimalist's toolkit for building fast, efficient, and maintainable websites and single-page applications - refined for real-world use.
 
 ## Philosophy
 
