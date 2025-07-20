@@ -12,11 +12,11 @@ In a world of heavyweight frameworks, Aether.js is intentionally small yet power
 
 ## What's New in v2.0
 
-ðŸš€ **Performance Optimized**: Batched state updates, automatic cleanup, and optimized DOM operations  
-ðŸ›¡ï¸ **Enhanced Reliability**: Comprehensive error handling, input validation, and graceful fallbacks  
-âš¡ **Advanced Features**: Middleware support, property validation, memory management, and developer tools  
-ðŸ”§ **Better DX**: Method chaining, cleanup functions, performance monitoring, and helpful warnings  
-ðŸ“¦ **Memory Safe**: Automatic dead reference cleanup and WeakMap usage where appropriate
+**Performance Optimized**: Batched state updates, automatic cleanup, and optimized DOM operations  
+**Enhanced Reliability**: Comprehensive error handling, input validation, and graceful fallbacks  
+**Advanced Features**: Middleware support, property validation, memory management, and developer tools  
+**Better DX**: Method chaining, cleanup functions, performance monitoring, and helpful warnings  
+**Memory Safe**: Automatic dead reference cleanup and WeakMap usage where appropriate
 
 ## Core Features
 
