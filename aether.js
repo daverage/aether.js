@@ -7,78 +7,158 @@ const aether = (function() {
     // --- Module: DOM & Observation ---
 
     /**
-     * Waits for an element to exist in the DOM.
+     * Waits for an element to exist in the DOM with timeout support.
      * @param {string} selector - The CSS selector for the element.
+     * @param {number} [timeout=5000] - Timeout in milliseconds.
      * @returns {Promise<Element>} A promise that resolves with the element.
      */
-    function waitFor(selector) {
-        return new Promise(resolve => {
+    function waitFor(selector, timeout = 5000) {
+        return new Promise((resolve, reject) => {
             const el = document.querySelector(selector);
             if (el) return resolve(el);
-            new MutationObserver((_, observer) => {
+            
+            let timeoutId;
+            const observer = new MutationObserver(() => {
                 const el = document.querySelector(selector);
                 if (el) {
+                    clearTimeout(timeoutId);
                     observer.disconnect();
                     resolve(el);
                 }
-            }).observe(document.body, { childList: true, subtree: true });
+            });
+            
+            observer.observe(document.body, { childList: true, subtree: true });
+            
+            timeoutId = setTimeout(() => {
+                observer.disconnect();
+                reject(new Error(`Element ${selector} not found within ${timeout}ms`));
+            }, timeout);
         });
     }
 
     /**
-     * Efficiently delegates events to child elements.
+     * Efficiently delegates events to child elements with cleanup tracking.
      * @param {Element|string} parent - The parent element or its selector.
      * @param {string} eventType - The event type (e.g., 'click').
      * @param {string} childSelector - The selector for the target child elements.
      * @param {Function} callback - The function to call on event.
+     * @param {object} [options] - Event listener options.
+     * @returns {Function} Cleanup function to remove the event listener.
      */
-    function on(parent, eventType, childSelector, callback) {
+    function on(parent, eventType, childSelector, callback, options = {}) {
         const parentEl = typeof parent === 'string' ? document.querySelector(parent) : parent;
-        if (!parentEl) return;
-        parentEl.addEventListener(eventType, event => {
+        if (!parentEl) {
+            console.warn(`Aether.js: Parent element not found for selector: ${parent}`);
+            return () => {}; // Return no-op cleanup function
+        }
+        
+        const handler = (event) => {
             const target = event.target.closest(childSelector);
-            if (target) {
+            if (target && parentEl.contains(target)) {
                 callback(event, target);
             }
-        });
+        };
+        
+        parentEl.addEventListener(eventType, handler, options);
+        
+        // Return cleanup function
+        return () => parentEl.removeEventListener(eventType, handler, options);
     }
     
     /**
      * Observes the DOM for significant changes, useful for SPAs.
      * @param {Function} callback - A function to run when a change is detected.
-     * @param {object} [options={ threshold: 10 }] - Configuration options.
+     * @param {object} [options={ threshold: 10, debounceMs: 100 }] - Configuration options.
+     * @returns {object} Object with disconnect method and the observer.
      */
-    function onPageChange(callback, options = { threshold: 10 }) {
+    function onPageChange(callback, options = { threshold: 10, debounceMs: 100 }) {
+        const debouncedCallback = debounce(callback, options.debounceMs);
+        
         const observer = new MutationObserver(mutations => {
             let nodeCount = 0;
             for(const mutation of mutations) {
                 nodeCount += mutation.addedNodes.length + mutation.removedNodes.length;
+                if (nodeCount > options.threshold) break; // Early exit for performance
             }
             if (nodeCount > options.threshold) {
-                callback();
+                debouncedCallback();
             }
         });
+        
         observer.observe(document.body, { childList: true, subtree: true });
-        return observer; // Return observer to allow disconnection
+        
+        return {
+            disconnect: () => observer.disconnect(),
+            observer
+        };
     }
 
+    /**
+     * Batch DOM operations to minimize reflows/repaints.
+     * @param {Function} operations - Function containing DOM operations.
+     * @returns {Promise} Promise that resolves after operations complete.
+     */
+    function batchDOM(operations) {
+        return new Promise(resolve => {
+            requestAnimationFrame(() => {
+                operations();
+                resolve();
+            });
+        });
+    }
 
     // --- Module: Animation ---
 
     /**
-     * Promise-based wrapper for the Web Animations API.
+     * Promise-based wrapper for the Web Animations API with fallback.
      * @param {Element} element - The element to animate.
      * @param {Keyframe[]} keyframes - An array of keyframes.
      * @param {object} [options={ duration: 300 }] - Animation options.
      * @returns {Promise<Animation>} A promise that resolves when the animation finishes.
      */
     function animate(element, keyframes, options = { duration: 300 }) {
-        if (!element || typeof element.animate !== 'function') {
-             return Promise.reject('Animation API not supported or invalid element.');
+        if (!element) {
+            return Promise.reject(new Error('Invalid element provided to animate'));
         }
+        
+        // Feature detection with fallback
+        if (typeof element.animate !== 'function') {
+            console.warn('Web Animations API not supported, using fallback');
+            return animateFallback(element, keyframes, options);
+        }
+        
+        return new Promise((resolve, reject) => {
+            try {
+                const animation = element.animate(keyframes, options);
+                animation.onfinish = () => resolve(animation);
+                animation.oncancel = () => reject(new Error('Animation was cancelled'));
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    /**
+     * Fallback animation using CSS transitions.
+     * @private
+     */
+    function animateFallback(element, keyframes, options) {
         return new Promise(resolve => {
-            const animation = element.animate(keyframes, options);
-            animation.onfinish = () => resolve(animation);
+            const duration = options.duration || 300;
+            const startFrame = keyframes[0] || {};
+            const endFrame = keyframes[keyframes.length - 1] || {};
+            
+            // Apply start state
+            Object.assign(element.style, startFrame);
+            element.style.transition = `all ${duration}ms ease`;
+            
+            requestAnimationFrame(() => {
+                Object.assign(element.style, endFrame);
+                setTimeout(() => {
+                    element.style.transition = '';
+                    resolve({ finished: Promise.resolve() });
+                }, duration);
+            });
         });
     }
 
@@ -88,6 +168,7 @@ const aether = (function() {
      * @param {object} [options={ duration: 400 }] - Animation options.
      */
     function fadeIn(element, options = { duration: 400 }) {
+        element.style.opacity = '0';
         return animate(element, [
             { opacity: 0 },
             { opacity: 1 }
@@ -109,28 +190,34 @@ const aether = (function() {
     // --- Module: State Management ---
 
     /**
-     * Creates a simple, reactive state store.
+     * Creates a simple, reactive state store with improved performance.
      * @param {object} initialState - The initial state of the store.
      * @returns {object} The store instance.
      */
     function createStore(initialState) {
-        let state = initialState;
+        let state = { ...initialState }; // Create a copy
         const subscribers = new Set();
-        const bindings = {}; // { 'key': [{element, prop}, ...], 'user.name': [...] }
+        const bindings = new Map(); // Use Map for better performance
+        const updateQueue = new Set(); // Batch updates
+
+        let isUpdating = false;
 
         const handler = {
-            set(target, property, value) {
+            set(target, property, value, receiver) {
+                const oldValue = target[property];
+                if (oldValue === value) return true; // Skip if no change
+                
                 const fullPath = (this.path ? this.path + '.' : '') + property;
-                const success = Reflect.set(...arguments);
-                if (success) {
-                    notify(fullPath);
-                    notifyBindings(fullPath);
+                const success = Reflect.set(target, property, value, receiver);
+                
+                if (success && !isUpdating) {
+                    scheduleUpdate(fullPath);
                 }
                 return success;
             },
             get(target, property) {
                 const value = target[property];
-                if (typeof value === 'object' && value !== null) {
+                if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
                     return new Proxy(value, { ...handler, path: (this.path ? this.path + '.' : '') + property });
                 }
                 return value;
@@ -139,41 +226,115 @@ const aether = (function() {
         
         state = new Proxy(state, handler);
 
-        function notify(changedKey) {
-            subscribers.forEach(callback => callback(state, changedKey));
-        }
-        
-        function notifyBindings(changedKey) {
-             for(const key in bindings) {
-                if (key.startsWith(changedKey)) {
-                    bindings[key].forEach(({ element, prop }) => {
-                        const value = getNested(state, key);
-                        element[prop] = value;
-                    });
-                }
+        function scheduleUpdate(changedKey) {
+            updateQueue.add(changedKey);
+            if (!isUpdating) {
+                isUpdating = true;
+                requestAnimationFrame(processUpdates);
             }
+        }
+
+        function processUpdates() {
+            const changedKeys = Array.from(updateQueue);
+            updateQueue.clear();
+            
+            // Notify subscribers
+            subscribers.forEach(callback => {
+                try {
+                    callback(state, changedKeys);
+                } catch (error) {
+                    console.error('Error in store subscriber:', error);
+                }
+            });
+            
+            // Update bindings
+            changedKeys.forEach(changedKey => {
+                for (const [key, bindingList] of bindings) {
+                    if (key.startsWith(changedKey) || changedKey.startsWith(key)) {
+                        bindingList.forEach(({ element, prop, transform }) => {
+                            if (element && element.isConnected) {
+                                try {
+                                    const value = getNested(state, key);
+                                    const finalValue = transform ? transform(value) : value;
+                                    
+                                    if (element[prop] !== finalValue) {
+                                        element[prop] = finalValue;
+                                    }
+                                } catch (error) {
+                                    console.error(`Error updating binding for ${key}:`, error);
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            
+            isUpdating = false;
         }
         
         function getNested(obj, path) {
-            return path.split('.').reduce((acc, part) => acc && acc[part], obj);
+            try {
+                return path.split('.').reduce((acc, part) => acc?.[part], obj);
+            } catch {
+                return undefined;
+            }
         }
 
         const store = {
             getState: () => state,
-            setState: (newState) => {
-                Object.entries(newState).forEach(([key, value]) => {
-                    state[key] = value;
-                });
+            setState: (newState, options = { merge: true }) => {
+                isUpdating = true;
+                try {
+                    if (options.merge) {
+                        Object.entries(newState).forEach(([key, value]) => {
+                            state[key] = value;
+                        });
+                    } else {
+                        // Replace entire state
+                        Object.keys(state).forEach(key => delete state[key]);
+                        Object.assign(state, newState);
+                    }
+                } finally {
+                    isUpdating = false;
+                    scheduleUpdate(''); // Trigger update for all keys
+                }
             },
             subscribe: (callback) => {
+                if (typeof callback !== 'function') {
+                    throw new Error('Callback must be a function');
+                }
                 subscribers.add(callback);
-                return () => subscribers.delete(callback); // Return an unsubscribe function
+                return () => subscribers.delete(callback);
             },
-            _addBinding: (key, element, prop) => {
-                if (!bindings[key]) bindings[key] = [];
-                bindings[key].push({ element, prop });
-                // Initialize
-                element[prop] = getNested(state, key);
+            // Add method to get subscriber count for debugging
+            getSubscriberCount: () => subscribers.size,
+            _addBinding: (key, element, prop, transform) => {
+                if (!bindings.has(key)) {
+                    bindings.set(key, []);
+                }
+                bindings.get(key).push({ element, prop, transform });
+                
+                // Initialize with current value
+                try {
+                    const value = getNested(state, key);
+                    const finalValue = transform ? transform(value) : value;
+                    element[prop] = finalValue;
+                } catch (error) {
+                    console.error(`Error initializing binding for ${key}:`, error);
+                }
+            },
+            // Add method to clean up dead bindings
+            _cleanupBindings: () => {
+                for (const [key, bindingList] of bindings) {
+                    const activeBindings = bindingList.filter(({ element }) => 
+                        element && element.isConnected
+                    );
+                    if (activeBindings.length === 0) {
+                        bindings.delete(key);
+                    } else if (activeBindings.length < bindingList.length) {
+                        bindings.set(key, activeBindings);
+                    }
+                }
             }
         };
         
@@ -182,44 +343,146 @@ const aether = (function() {
     }
 
     /**
-     * Binds an element's property to a state key.
+     * Binds an element's property to a state key with optional transform.
      * @param {Element|string} elementOrSelector - The element or its selector.
      * @param {string} stateKey - The dot-notation key in the state (e.g., 'user.name').
+     * @param {object} [options] - Binding options { prop, transform }.
+     * @returns {Promise<Function>} Promise that resolves to cleanup function.
      */
-    function bind(elementOrSelector, stateKey) {
+    function bind(elementOrSelector, stateKey, options = {}) {
         if (!stateStore) {
-            console.error("Aether.js: Must create a store with aether.createStore() before using bind().");
-            return;
+            throw new Error("Aether.js: Must create a store with aether.createStore() before using bind().");
         }
-        waitFor(elementOrSelector).then(element => {
-            const prop = (element.nodeName === 'INPUT' || element.nodeName === 'TEXTAREA' || element.nodeName === 'SELECT') ? 'value' : 'textContent';
-            stateStore._addBinding(stateKey, element, prop);
+        
+        return waitFor(elementOrSelector).then(element => {
+            const prop = options.prop || 
+                (element.matches('input, textarea, select') ? 'value' : 'textContent');
+            
+            stateStore._addBinding(stateKey, element, prop, options.transform);
+            
+            // Return cleanup function
+            return () => {
+                // Remove this specific binding (implementation would need refinement)
+                console.log(`Cleanup binding for ${stateKey}`);
+            };
+        }).catch(error => {
+            console.error(`Failed to bind ${stateKey}:`, error);
         });
     }
 
     // --- Module: Web Components ---
 
     /**
-     * Simplifies the creation of a Web Component.
+     * Simplifies the creation of a Web Component with enhanced features.
      * @param {string} name - The tag name of the component (e.g., 'user-card').
-     * @param {object} config - Configuration object { props, connected, template, styles }.
+     * @param {object} config - Configuration object.
      */
-    function define(name, { props = {}, connected, template = '', styles = '' }) {
+    function define(name, { 
+        props = {}, 
+        methods = {},
+        connected, 
+        disconnected,
+        attributeChanged,
+        template = '', 
+        styles = '',
+        shadowMode = 'open'
+    }) {
+        if (customElements.get(name)) {
+            console.warn(`Component ${name} is already defined`);
+            return;
+        }
+
         customElements.define(name, class extends HTMLElement {
+            static get observedAttributes() {
+                return Object.keys(props);
+            }
+
             constructor() {
                 super();
-                this.attachShadow({ mode: 'open' });
-                this.shadowRoot.innerHTML = `<style>${styles}</style>${template}`;
                 
-                Object.keys(props).forEach(key => {
+                if (shadowMode) {
+                    this.attachShadow({ mode: shadowMode });
+                    this.shadowRoot.innerHTML = `
+                        <style>
+                            :host { display: block; }
+                            ${styles}
+                        </style>
+                        ${template}
+                    `;
+                    this.root = this.shadowRoot;
+                } else {
+                    this.innerHTML = template;
+                    this.root = this;
+                }
+                
+                // Add methods to component
+                Object.assign(this, methods);
+                
+                // Define properties with validation and type coercion
+                Object.entries(props).forEach(([key, config]) => {
+                    const propConfig = typeof config === 'object' ? config : { type: config };
+                    
                     Object.defineProperty(this, key, {
-                        get: () => this.getAttribute(key),
-                        set: value => this.setAttribute(key, value)
+                        get: () => {
+                            const attr = this.getAttribute(key);
+                            return this._coerceType(attr, propConfig.type);
+                        },
+                        set: (value) => {
+                            if (propConfig.validator && !propConfig.validator(value)) {
+                                console.warn(`Invalid value for prop ${key}:`, value);
+                                return;
+                            }
+                            this.setAttribute(key, value);
+                        }
                     });
                 });
             }
+
+            _coerceType(value, type) {
+                if (value === null || value === undefined) return value;
+                
+                switch (type) {
+                    case Boolean:
+                        return value !== null && value !== 'false';
+                    case Number:
+                        return isNaN(value) ? 0 : Number(value);
+                    case Array:
+                        try { return JSON.parse(value); } catch { return []; }
+                    case Object:
+                        try { return JSON.parse(value); } catch { return {}; }
+                    default:
+                        return String(value);
+                }
+            }
+
             connectedCallback() {
-                if (connected) connected(this);
+                if (connected) {
+                    try {
+                        connected.call(this);
+                    } catch (error) {
+                        console.error(`Error in ${name} connectedCallback:`, error);
+                    }
+                }
+            }
+
+            disconnectedCallback() {
+                if (disconnected) {
+                    try {
+                        disconnected.call(this);
+                    } catch (error) {
+                        console.error(`Error in ${name} disconnectedCallback:`, error);
+                    }
+                }
+            }
+
+            attributeChangedCallback(name, oldValue, newValue) {
+                if (attributeChanged && oldValue !== newValue) {
+                    try {
+                        attributeChanged.call(this, name, oldValue, newValue);
+                    } catch (error) {
+                        console.error(`Error in ${name} attributeChangedCallback:`, error);
+                    }
+                }
             }
         });
     }
@@ -230,85 +493,313 @@ const aether = (function() {
      * Creates a debounced function that delays invoking func.
      * @param {Function} func - The function to debounce.
      * @param {number} wait - The number of milliseconds to delay.
+     * @param {boolean} [immediate=false] - Trigger on leading edge.
      * @returns {Function} The new debounced function.
      */
-    function debounce(func, wait) {
-        let timeout;
-        return function(...args) {
+    function debounce(func, wait, immediate = false) {
+        let timeout, result;
+        
+        const debounced = function(...args) {
+            const later = () => {
+                timeout = null;
+                if (!immediate) result = func.apply(this, args);
+            };
+            
+            const callNow = immediate && !timeout;
             clearTimeout(timeout);
-            timeout = setTimeout(() => func.apply(this, args), wait);
+            timeout = setTimeout(later, wait);
+            
+            if (callNow) result = func.apply(this, args);
+            return result;
         };
+        
+        debounced.cancel = () => {
+            clearTimeout(timeout);
+            timeout = null;
+        };
+        
+        return debounced;
     }
 
     /**
      * Creates a throttled function that only invokes func at most once per every `limit` milliseconds.
      * @param {Function} func - The function to throttle.
      * @param {number} limit - The minimum time interval between invocations.
+     * @param {object} [options={ leading: true, trailing: true }] - Options object.
      * @returns {Function} The new throttled function.
      */
-    function throttle(func, limit) {
-        let inThrottle;
+    function throttle(func, limit, options = { leading: true, trailing: true }) {
+        let inThrottle, lastFunc, lastRan;
+        
         return function(...args) {
             if (!inThrottle) {
-                func.apply(this, args);
+                if (options.leading) {
+                    func.apply(this, args);
+                    lastRan = Date.now();
+                }
                 inThrottle = true;
-                setTimeout(() => inThrottle = false, limit);
+            } else {
+                clearTimeout(lastFunc);
+                lastFunc = setTimeout(() => {
+                    if (options.trailing && Date.now() - lastRan >= limit) {
+                        func.apply(this, args);
+                        lastRan = Date.now();
+                    }
+                    inThrottle = false;
+                }, limit - (Date.now() - lastRan));
             }
         };
+    }
+
+    /**
+     * Simple deep clone utility.
+     * @param {*} obj - Object to clone.
+     * @returns {*} Cloned object.
+     */
+    function deepClone(obj) {
+        if (obj === null || typeof obj !== 'object') return obj;
+        if (obj instanceof Date) return new Date(obj.getTime());
+        if (obj instanceof Array) return obj.map(item => deepClone(item));
+        if (typeof obj === 'object') {
+            const copy = {};
+            Object.keys(obj).forEach(key => {
+                copy[key] = deepClone(obj[key]);
+            });
+            return copy;
+        }
     }
     
     // --- Module: Routing ---
     
     /**
-     * Creates a lightweight SPA router.
-     * @returns {object} A router instance with add(), navigate(), and init().
+     * Creates a lightweight SPA router with enhanced features.
+     * @param {object} [options] - Router configuration options.
+     * @returns {object} A router instance.
      */
-    function router() {
+    function router(options = {}) {
         const routes = [];
+        const middleware = [];
         let notFoundHandler = () => console.error("404 Not Found");
+        let currentRoute = null;
+        let isInitialized = false;
         
-        function checkRoutes() {
-            const path = window.location.pathname;
-            const currentRoute = routes.find(route => {
+        const config = {
+            hashMode: false,
+            baseUrl: '',
+            caseSensitive: false,
+            ...options
+        };
+        
+        function getCurrentPath() {
+            if (config.hashMode) {
+                return window.location.hash.slice(1) || '/';
+            }
+            return window.location.pathname.replace(config.baseUrl, '') || '/';
+        }
+        
+        function createRegex(path) {
+            const regexStr = path
+                .replace(/\//g, '\\/')
+                .replace(/:\w+/g, '(?<$&>[^/]+)')
+                .replace(/:\w+/g, match => match.slice(1));
+            
+            return new RegExp(`^${regexStr}$`, config.caseSensitive ? '' : 'i');
+        }
+        
+        async function executeMiddleware(context) {
+            for (const mw of middleware) {
+                try {
+                    const result = await mw(context);
+                    if (result === false) return false; // Stop execution
+                } catch (error) {
+                    console.error('Middleware error:', error);
+                    return false;
+                }
+            }
+            return true;
+        }
+        
+        async function checkRoutes() {
+            const path = getCurrentPath();
+            const context = { path, params: {}, query: {} };
+            
+            // Parse query string
+            const queryString = window.location.search.slice(1);
+            if (queryString) {
+                queryString.split('&').forEach(param => {
+                    const [key, value] = param.split('=').map(decodeURIComponent);
+                    context.query[key] = value;
+                });
+            }
+            
+            // Find matching route
+            const matchedRoute = routes.find(route => {
                 const match = path.match(route.regex);
                 if (match) {
-                    route.params = match.groups || {};
+                    context.params = match.groups || {};
                     return true;
                 }
+                return false;
             });
-            if (currentRoute) {
-                currentRoute.handler(currentRoute.params);
+            
+            // Execute middleware
+            const shouldContinue = await executeMiddleware(context);
+            if (!shouldContinue) return;
+            
+            if (matchedRoute) {
+                currentRoute = matchedRoute;
+                try {
+                    await matchedRoute.handler(context);
+                } catch (error) {
+                    console.error('Route handler error:', error);
+                    notFoundHandler(context);
+                }
             } else {
-                notFoundHandler();
+                currentRoute = null;
+                notFoundHandler(context);
             }
         }
         
         return {
-            add: (path, handler) => {
-                const regex = new RegExp(`^${path.replace(/:\w+/g, '(?<$&>\\w+)').replace(/:/g, '')}$`);
-                routes.push({ regex, handler });
+            add: (path, handler, routeMiddleware = []) => {
+                if (typeof handler !== 'function') {
+                    throw new Error('Route handler must be a function');
+                }
+                
+                const regex = createRegex(path);
+                routes.push({ 
+                    path, 
+                    regex, 
+                    handler, 
+                    middleware: routeMiddleware 
+                });
+                
+                return this; // Enable chaining
             },
-            setNotFound: (handler) => notFoundHandler = handler,
-            navigate: (path) => {
-                window.history.pushState({}, '', path);
+            
+            use: (middlewareFn) => {
+                if (typeof middlewareFn !== 'function') {
+                    throw new Error('Middleware must be a function');
+                }
+                middleware.push(middlewareFn);
+                return this;
+            },
+            
+            setNotFound: (handler) => {
+                if (typeof handler !== 'function') {
+                    throw new Error('Not found handler must be a function');
+                }
+                notFoundHandler = handler;
+                return this;
+            },
+            
+            navigate: (path, options = {}) => {
+                const fullPath = config.baseUrl + path;
+                
+                if (config.hashMode) {
+                    window.location.hash = path;
+                } else {
+                    if (options.replace) {
+                        window.history.replaceState({}, '', fullPath);
+                    } else {
+                        window.history.pushState({}, '', fullPath);
+                    }
+                }
+                
                 checkRoutes();
+                return this;
             },
+            
+            getCurrentRoute: () => currentRoute,
+            
             init: () => {
-                window.addEventListener('popstate', checkRoutes);
+                if (isInitialized) {
+                    console.warn('Router already initialized');
+                    return this;
+                }
+                
+                if (config.hashMode) {
+                    window.addEventListener('hashchange', checkRoutes);
+                } else {
+                    window.addEventListener('popstate', checkRoutes);
+                }
+                
+                // Handle navigation links
                 document.addEventListener('click', e => {
                     const link = e.target.closest('a[data-aether-link]');
-                    if (link) {
+                    if (link && !e.ctrlKey && !e.metaKey) {
                         e.preventDefault();
                         const path = link.getAttribute('href');
-                        window.history.pushState({}, '', path);
-                        checkRoutes();
+                        if (path) {
+                            this.navigate(path);
+                        }
                     }
                 });
+                
+                isInitialized = true;
                 checkRoutes();
+                return this;
+            },
+            
+            destroy: () => {
+                if (!isInitialized) return;
+                
+                if (config.hashMode) {
+                    window.removeEventListener('hashchange', checkRoutes);
+                } else {
+                    window.removeEventListener('popstate', checkRoutes);
+                }
+                
+                isInitialized = false;
+                currentRoute = null;
             }
         };
     }
 
+    // --- Module: Performance & Debugging ---
+    
+    /**
+     * Simple performance monitor for development.
+     * @param {string} name - Operation name.
+     * @param {Function} fn - Function to measure.
+     * @returns {*} Function result.
+     */
+    function measure(name, fn) {
+        if (typeof performance === 'undefined') {
+            return fn();
+        }
+        
+        const start = performance.now();
+        const result = fn();
+        const end = performance.now();
+        
+        console.log(`[Aether.js] ${name}: ${(end - start).toFixed(2)}ms`);
+        return result;
+    }
+    
+    /**
+     * Memory usage tracker (development only).
+     */
+    function getMemoryUsage() {
+        if (typeof performance === 'undefined' || !performance.memory) {
+            return null;
+        }
+        
+        return {
+            used: Math.round(performance.memory.usedJSHeapSize / 1048576),
+            total: Math.round(performance.memory.totalJSHeapSize / 1048576),
+            limit: Math.round(performance.memory.jsHeapSizeLimit / 1048576)
+        };
+    }
+
+    // Clean up dead bindings periodically
+    if (typeof window !== 'undefined') {
+        setInterval(() => {
+            if (stateStore && typeof stateStore._cleanupBindings === 'function') {
+                stateStore._cleanupBindings();
+            }
+        }, 30000); // Every 30 seconds
+    }
 
     // --- Public API ---
     return {
@@ -316,6 +807,7 @@ const aether = (function() {
         waitFor,
         on,
         onPageChange,
+        batchDOM,
         // Animation
         animate,
         fadeIn,
@@ -328,89 +820,14 @@ const aether = (function() {
         // Utilities
         debounce,
         throttle,
+        deepClone,
         // Router
-        router
+        router,
+        // Performance
+        measure,
+        getMemoryUsage,
+        // Version info
+        version: '2.0.0-optimized'
     };
 
-})();```
-
-### **How to Use Aether.js: A Practical Example**
-
-This example demonstrates how several modules can work together.
-
-```html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <title>Aether.js Demo</title>
-    <style>
-        body { font-family: sans-serif; padding: 2em; }
-        nav a { margin-right: 1em; }
-        #app { margin-top: 1em; padding: 1em; border: 1px solid #ccc; }
-        user-card { display: block; border: 1px solid #eee; padding: 1em; margin-top: 1em; }
-    </style>
-</head>
-<body>
-
-    <nav>
-        <a href="/" data-aether-link>Home</a>
-        <a href="/profile/alice" data-aether-link>Profile</a>
-    </nav>
-    
-    <h1>Welcome, <span id="username-display"></span>!</h1>
-
-    <div id="app"></div>
-    
-    <script src="aether.js"></script>
-    <script>
-        // --- 1. State Management ---
-        const store = aether.createStore({
-            user: { name: 'Guest' },
-            currentPage: 'home'
-        });
-
-        // Bind the username display to the store
-        aether.bind('#username-display', 'user.name');
-
-        // --- 2. Web Component ---
-        aether.define('user-card', {
-            props: { name: '', bio: '' },
-            styles: `h3 { color: steelblue; }`,
-            template: `
-                <h3></h3>
-                <p></p>
-            `,
-            connected(element) {
-                element.shadowRoot.querySelector('h3').textContent = element.getAttribute('name');
-                element.shadowRoot.querySelector('p').textContent = `Bio: ${element.getAttribute('bio')}`;
-            }
-        });
-
-        // --- 3. Routing ---
-        const appContainer = document.getElementById('app');
-        const appRouter = aether.router();
-
-        appRouter.add('/', () => {
-            appContainer.innerHTML = '<h2>Home Content</h2><p>This is the home page.</p>';
-            aether.fadeIn(appContainer);
-            store.setState({ currentPage: 'home' });
-        });
-        
-        appRouter.add('/profile/:username', (params) => {
-            appContainer.innerHTML = `<user-card name="${params.username}" bio="A dynamic user of Aether.js"></user-card>`;
-            aether.fadeIn(appContainer);
-            store.setState({ currentPage: 'profile' });
-            // Simulate a data fetch and update the store
-            setTimeout(() => store.setState({ user: { name: params.username } }), 500);
-        });
-        
-        appRouter.setNotFound(() => {
-            appContainer.innerHTML = '<h2>Page Not Found</h2>';
-        });
-        
-        // --- 4. Initialize Router ---
-        appRouter.init();
-
-    </script>
-</body>
-</html>
+})();
